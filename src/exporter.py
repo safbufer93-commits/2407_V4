@@ -3,6 +3,7 @@ Exporter module: writes data to rotating XLSX files (500k rows each).
 """
 import logging
 import os
+import re
 from typing import Optional, List, Any
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,27 @@ class RotatingXlsxWriter:
         self._worksheet = None
         self._current_path = None
         os.makedirs(output_dir, exist_ok=True)
+        self.file_index = self._detect_next_file_index()
         self._open_new_file()
+
+    def _detect_next_file_index(self) -> int:
+        """
+        Return next free index to avoid overwriting previous run outputs.
+        Example: existing *_0001.xlsx and *_0002.xlsx -> start from 3.
+        """
+        max_idx = 0
+        pattern = re.compile(rf"^{re.escape(self.base_name)}_(\d{{4}})\.xlsx$", re.IGNORECASE)
+        try:
+            for name in os.listdir(self.output_dir):
+                m = pattern.match(name)
+                if not m:
+                    continue
+                idx = int(m.group(1))
+                if idx > max_idx:
+                    max_idx = idx
+        except Exception as e:
+            logger.warning(f"Could not scan existing XLSX outputs: {e}")
+        return max_idx + 1
 
     def _current_file_path(self) -> str:
         return os.path.join(self.output_dir, f"{self.base_name}_{self.file_index:04d}.xlsx")
@@ -200,7 +221,23 @@ class CsvWriter:
         self._file = None
         self._writer = None
         os.makedirs(output_dir, exist_ok=True)
+        self.file_index = self._detect_next_file_index()
         self._open_new_file()
+
+    def _detect_next_file_index(self) -> int:
+        max_idx = 0
+        pattern = re.compile(rf"^{re.escape(self.base_name)}_(\d{{4}})\.csv$", re.IGNORECASE)
+        try:
+            for name in os.listdir(self.output_dir):
+                m = pattern.match(name)
+                if not m:
+                    continue
+                idx = int(m.group(1))
+                if idx > max_idx:
+                    max_idx = idx
+        except Exception as e:
+            logger.warning(f"Could not scan existing CSV outputs: {e}")
+        return max_idx + 1
 
     def _open_new_file(self):
         if self._file:

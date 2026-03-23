@@ -432,6 +432,7 @@ def main():
         return crawler.crawl_seed(seed_or_cat)
 
     products_count = 0
+    last_product_info = None
 
     try:
         if categories_file:
@@ -577,6 +578,16 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("Interrupted")
+        if not args.no_resume and last_product_info:
+            checkpoint = {
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "source_section": last_product_info.get("source_section"),
+                "source_subsection": last_product_info.get("source_subsection"),
+                "source_url": last_product_info.get("source_url"),
+                "product_url": last_product_info.get("product_url"),
+                "error": "keyboard_interrupt",
+            }
+            save_resume_state(resume_file, checkpoint)
     except RendererUnavailableError as e:
         terminated_due_renderer = True
         logger.error(f"Renderer unavailable, stopping run: {e}", exc_info=True)
