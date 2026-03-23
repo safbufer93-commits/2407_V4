@@ -139,6 +139,13 @@ class DolphinRenderer:
                             )
                             self._consecutive_start_failures = 0
                             return ws_endpoint
+                        logger.warning(
+                            "Dolphin reports profile already running but no ws endpoint found; "
+                            "trying stop/start recovery"
+                        )
+                        self._stop_profile()
+                        time.sleep(2)
+                        continue
                     raise Exception(
                         f"Dolphin start HTTP {r.status_code}: {message}"
                     )
@@ -157,6 +164,13 @@ class DolphinRenderer:
                             )
                             self._consecutive_start_failures = 0
                             return ws_endpoint
+                        logger.warning(
+                            "Dolphin reports duplicate-running without ws endpoint; "
+                            "trying stop/start recovery"
+                        )
+                        self._stop_profile()
+                        time.sleep(2)
+                        continue
                     raise Exception(f"Dolphin start failed: {message}")
 
                 automation = data.get("automation") or {}
@@ -214,6 +228,14 @@ class DolphinRenderer:
         self._ws_endpoint = ws_endpoint
         logger.info("Connected to Dolphin browser")
 
+    @staticmethod
+    def _is_sync_api_in_async_loop_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "sync api inside the asyncio loop" in msg
+            or "please use the async api instead" in msg
+        )
+
     def _connect(self):
         """
         Connect to Dolphin.
@@ -231,7 +253,9 @@ class DolphinRenderer:
             except Exception as e:
                 last_error = e
                 logger.warning(f"Failed to reattach to existing ws endpoint: {e}")
-                self._disconnect(keep_ws=False)
+                # Keep Playwright runtime alive on reconnect path to avoid
+                # re-entering sync_playwright() and hitting asyncio-loop guard.
+                self._disconnect(keep_ws=False, keep_pw_runtime=True)
 
         try:
             ws_endpoint = self._start_profile()
@@ -242,14 +266,15 @@ class DolphinRenderer:
             last_error = e
             msg = str(e)
 
-            if "already running" in msg or "E_BROWSER_RUN_DUPLICATE" in msg:
-                if self._ws_endpoint:
+            if "already running" in msg or "e_browser_run_duplicate" in msg.lower():
+                candidate_ws = self._fetch_running_ws_endpoint() or self._ws_endpoint
+                if candidate_ws:
                     logger.warning(
-                        "Profile already running, trying to reattach via saved ws endpoint"
+                        "Profile already running, trying to attach via discovered ws endpoint"
                     )
                     try:
                         time.sleep(2)
-                        self._attach_to_ws(self._ws_endpoint)
+                        self._attach_to_ws(candidate_ws)
                         return
                     except Exception as e2:
                         last_error = e2
@@ -259,7 +284,7 @@ class DolphinRenderer:
                 raise last_error
             raise Exception(f"Connect failed: {last_error}")
 
-    def _disconnect(self, keep_ws: bool = True):
+    def _disconnect(self, keep_ws: bool = True, keep_pw_runtime: bool = False):
         try:
             if self._page:
                 try:
@@ -279,7 +304,7 @@ class DolphinRenderer:
                 except Exception:
                     pass
 
-            if self._pw:
+            if self._pw and not keep_pw_runtime:
                 try:
                     self._pw.__exit__(None, None, None)
                 except Exception:
@@ -290,7 +315,8 @@ class DolphinRenderer:
         self._browser = None
         self._context = None
         self._page = None
-        self._pw = None
+        if not keep_pw_runtime:
+            self._pw = None
 
         if not keep_ws:
             self._ws_endpoint = None
@@ -479,13 +505,25 @@ class DolphinRenderer:
 
                 if attempt >= 1:
                     try:
-                        self._disconnect(keep_ws=True)
+                        self._disconnect(keep_ws=True, keep_pw_runtime=True)
                         time.sleep(2)
                         self._connect()
                     except Exception as e2:
                         if isinstance(e2, RendererUnavailableError):
                             logger.error(f"Reconnect failed permanently: {e2}")
                             raise
+                        if self._is_sync_api_in_async_loop_error(e2):
+                            logger.warning(
+                                "Reconnect failed due to Playwright sync-in-async-loop guard; "
+                                "forcing full runtime reset"
+                            )
+                            try:
+                                self._disconnect(keep_ws=False, keep_pw_runtime=False)
+                                time.sleep(2)
+                                self._connect()
+                                continue
+                            except Exception as e3:
+                                logger.error(f"Reconnect after full reset failed: {e3}")
                         logger.error(f"Reconnect failed: {e2}")
 
         logger.error(f"All retries failed for {url}")
