@@ -17,6 +17,7 @@ Options:
 """
 import argparse
 import csv
+import json
 import logging
 import os
 import re
@@ -38,6 +39,7 @@ from config.settings import (
     DOLPHIN_PROFILE_ID,
     REQUEST_DELAY_MIN,
     REQUEST_DELAY_MAX,
+    MAX_RETRIES,
 )
 from src.logger import setup_logging, Metrics
 from src.crawler import CategoryCrawler, SitemapParser
@@ -151,7 +153,87 @@ def parse_args():
         help="Path to CSV/TXT with category URLs (skips seed-based discovery). "
         "Auto-detected if config/sitemap-category-ru.csv exists.",
     )
+    parser.add_argument(
+        "--resume-file",
+        default=None,
+        help="Path to resume checkpoint JSON (default: ./logs/resume_checkpoint.json)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore existing resume checkpoint and do not save a new one",
+    )
+    parser.add_argument(
+        "--renderer-recover-retries",
+        type=int,
+        default=int(os.environ.get("RENDERER_RECOVER_RETRIES", "2")),
+        help="How many times to recover renderer and retry same product on renderer outage",
+    )
+    parser.add_argument(
+        "--renderer-recover-wait",
+        type=int,
+        default=int(os.environ.get("RENDERER_RECOVER_WAIT", "10")),
+        help="Seconds to wait before renderer recovery attempt",
+    )
     return parser.parse_args()
+
+
+def _default_resume_file() -> str:
+    return os.path.join(LOG_DIR, "resume_checkpoint.json")
+
+
+def load_resume_state(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.warning(f"Could not load resume checkpoint {path}: {e}")
+    return {}
+
+
+def save_resume_state(path: str, state: dict):
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, indent=2)
+        logger.warning(
+            f"Saved resume checkpoint: product={state.get('product_url')} source={state.get('source_url')}"
+        )
+    except Exception as e:
+        logger.error(f"Could not save resume checkpoint {path}: {e}")
+
+
+def clear_resume_state(path: str):
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info(f"Cleared resume checkpoint: {path}")
+    except Exception as e:
+        logger.warning(f"Could not clear resume checkpoint {path}: {e}")
+
+
+def recover_renderer(renderer, wait_seconds: int = 10) -> bool:
+    try:
+        renderer.close()
+    except Exception:
+        pass
+
+    time.sleep(max(1, wait_seconds))
+
+    try:
+        renderer.setup_poland()
+        return True
+    except Exception as e:
+        logger.warning(f"Renderer recovery attempt failed: {e}")
+        return False
 
 
 def build_renderer():
@@ -161,6 +243,7 @@ def build_renderer():
         profile_id=DOLPHIN_PROFILE_ID,
         delay_min=REQUEST_DELAY_MIN,
         delay_max=REQUEST_DELAY_MAX,
+        max_retries=MAX_RETRIES,
     )
 
 
@@ -286,6 +369,24 @@ def main():
     setup_logging(LOG_DIR, args.log_level)
     logger.info("2407.pl fitment crawler starting (Dolphin Anty mode)")
 
+    resume_file = args.resume_file or _default_resume_file()
+    resume_state = {}
+    if args.no_resume:
+        logger.info("Resume is disabled via --no-resume")
+    else:
+        resume_state = load_resume_state(resume_file)
+        if resume_state.get("product_url"):
+            logger.info(
+                "Resume checkpoint loaded: "
+                f"product={resume_state.get('product_url')} "
+                f"source={resume_state.get('source_url')}"
+            )
+
+    resume_active = bool(resume_state.get("product_url")) and not args.no_resume
+    resume_hit = False
+    terminated_due_renderer = False
+    completed_without_fatal = False
+
     renderer = build_renderer()
 
     logger.info("Setting up Poland/PLN context...")
@@ -353,6 +454,7 @@ def main():
                 except StopIteration:
                     break
                 except RendererUnavailableError:
+                    terminated_due_renderer = True
                     raise
                 except Exception as e:
                     metrics.record_error("listing_iteration_fatal")
@@ -366,16 +468,63 @@ def main():
                     seen_per_source[src_url] = set()
                 if prod_url in seen_per_source[src_url]:
                     continue
+
+                # Resume: skip everything before the checkpoint product.
+                if resume_active:
+                    target_url = resume_state.get("product_url")
+                    if prod_url != target_url:
+                        seen_per_source[src_url].add(prod_url)
+                        continue
+                    target_source = resume_state.get("source_url")
+                    if target_source and src_url != target_source:
+                        logger.warning(
+                            "Resume product matched with a different source URL: "
+                            f"saved={target_source}, current={src_url}"
+                        )
+                    resume_active = False
+                    resume_hit = True
+                    logger.info(f"Resume checkpoint reached at product: {prod_url}")
+
                 seen_per_source[src_url].add(prod_url)
 
-                try:
-                    rows = process_product(product_info, renderer, metrics)
-                except RendererUnavailableError:
-                    raise
-                except Exception as e:
-                    metrics.record_error("product_processing_fatal")
-                    logger.error(f"Product processing fatal for {prod_url}: {e}", exc_info=True)
-                    continue
+                recover_attempt = 0
+                max_recover = max(0, args.renderer_recover_retries)
+                rows = None
+                while True:
+                    try:
+                        rows = process_product(product_info, renderer, metrics)
+                        break
+                    except RendererUnavailableError as e:
+                        checkpoint = {
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                            "source_section": product_info.get("source_section"),
+                            "source_subsection": product_info.get("source_subsection"),
+                            "source_url": src_url,
+                            "product_url": prod_url,
+                            "error": str(e),
+                        }
+                        if not args.no_resume:
+                            save_resume_state(resume_file, checkpoint)
+
+                        if recover_attempt >= max_recover:
+                            terminated_due_renderer = True
+                            raise
+
+                        recover_attempt += 1
+                        metrics.record_error("renderer_unavailable_retry")
+                        logger.warning(
+                            f"Renderer unavailable at {prod_url}. "
+                            f"Recovery attempt {recover_attempt}/{max_recover}..."
+                        )
+
+                        if not recover_renderer(renderer, args.renderer_recover_wait):
+                            continue
+                        logger.info(f"Renderer recovered, retrying product: {prod_url}")
+                    except Exception as e:
+                        metrics.record_error("product_processing_fatal")
+                        logger.error(f"Product processing fatal for {prod_url}: {e}", exc_info=True)
+                        rows = []
+                        break
 
                 for row in rows:
                     xlsx_writer.write_row(row)
@@ -406,9 +555,18 @@ def main():
             if args.limit and products_count >= args.limit:
                 break
 
+        if resume_active and not resume_hit and not args.no_resume:
+            logger.warning(
+                "Resume checkpoint product was not found in current run. "
+                "Starting from the beginning may be required."
+            )
+
+        completed_without_fatal = True
+
     except KeyboardInterrupt:
         logger.info("Interrupted")
     except RendererUnavailableError as e:
+        terminated_due_renderer = True
         logger.error(f"Renderer unavailable, stopping run: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Fatal: {e}", exc_info=True)
@@ -426,6 +584,8 @@ def main():
         metrics.save_report(report)
         metrics.print_summary()
         logger.info(f"Done. Output: {output_dir}")
+        if not args.no_resume and completed_without_fatal and not terminated_due_renderer:
+            clear_resume_state(resume_file)
 
 
 if __name__ == "__main__":
