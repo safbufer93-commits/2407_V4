@@ -447,13 +447,25 @@ def main():
             seed_count = 0
 
             product_iter = iter(_iter_products(seed))
+            last_product_info = None
 
             while True:
                 try:
                     product_info = next(product_iter)
+                    last_product_info = product_info
                 except StopIteration:
                     break
                 except RendererUnavailableError:
+                    if not args.no_resume:
+                        checkpoint = {
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                            "source_section": (last_product_info or {}).get("source_section", seed["section"]),
+                            "source_subsection": (last_product_info or {}).get("source_subsection", ""),
+                            "source_url": (last_product_info or {}).get("source_url", seed["url"]),
+                            "product_url": (last_product_info or {}).get("product_url", ""),
+                            "error": "renderer_unavailable_during_listing",
+                        }
+                        save_resume_state(resume_file, checkpoint)
                     terminated_due_renderer = True
                     raise
                 except Exception as e:

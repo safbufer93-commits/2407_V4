@@ -1,4 +1,4 @@
-"""
+﻿"""
 Crawler module: traverses only subcategories within seed URL scope.
 """
 import logging
@@ -7,6 +7,7 @@ from typing import List, Set, Generator
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 
 from bs4 import BeautifulSoup
+from src.renderer import RendererUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,8 @@ FORBIDDEN_PREFIXES = [
 BRAND_PATH_RE = re.compile(r"/([\w-]+-cars|[\w-]+-brand|[\w-]+-auto)/?$", re.I)
 BASE_DOMAIN = "2407.pl"
 
-DIRECTORY_MARKERS = ["Все категории", "Показать все категории"]
-LISTING_MARKERS = ["Результаты:", "Показать элементы", "Показать еще", "Сортировать по"]
+DIRECTORY_MARKERS = ["Р’СЃРµ РєР°С‚РµРіРѕСЂРёРё", "РџРѕРєР°Р·Р°С‚СЊ РІСЃРµ РєР°С‚РµРіРѕСЂРёРё"]
+LISTING_MARKERS = ["Р РµР·СѓР»СЊС‚Р°С‚С‹:", "РџРѕРєР°Р·Р°С‚СЊ СЌР»РµРјРµРЅС‚С‹", "РџРѕРєР°Р·Р°С‚СЊ РµС‰Рµ", "РЎРѕСЂС‚РёСЂРѕРІР°С‚СЊ РїРѕ"]
 LISTING_CSS = ["CatalogueListItem", "ListItemstyle", "SparePartsItem", "SparePartsList"]
 PRODUCT_CSS = [
     "CatalogueListItemTitle",
@@ -168,7 +169,7 @@ def extract_product_links(
     links = []
     seen = set()
 
-    # Try product CSS classes first — accept any depth >= 3 (/ru/cat/product/)
+    # Try product CSS classes first вЂ” accept any depth >= 3 (/ru/cat/product/)
     for css_pat in PRODUCT_CSS:
         for el in soup.find_all(class_=re.compile(css_pat)):
             a = el if el.name == "a" else el.find("a", href=True)
@@ -391,7 +392,7 @@ class CategoryCrawler:
         section = seed["section"]
         subsection = seed.get("subsection", url.rstrip("/").split("/")[-1])
         seed_path = urlparse(url).path
-        logger.info(f"Seed: {section} — {url} (scope: {seed_path})")
+        logger.info(f"Seed: {section} вЂ” {url} (scope: {seed_path})")
         yield from self._crawl_url(
             url,
             section,
@@ -425,6 +426,8 @@ class CategoryCrawler:
 
         try:
             html = self.renderer.fetch_html(url)
+        except RendererUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Listing fetch exception for {url}: {e}")
             return
@@ -435,7 +438,7 @@ class CategoryCrawler:
 
         soup = BeautifulSoup(html, "lxml")
         page_type = detect_page_type(soup)
-        logger.info(f"Page type: {page_type} — {url}")
+        logger.info(f"Page type: {page_type} вЂ” {url}")
 
         if page_type == "listing":
             yield from self._crawl_listing(url, soup, section, subsection, source_url)
@@ -494,6 +497,8 @@ class CategoryCrawler:
         if max_url != listing_url:
             try:
                 html2 = self.renderer.fetch_html(max_url)
+            except RendererUnavailableError:
+                raise
             except Exception as e:
                 logger.warning(f"Listing fetch exception for {max_url}: {e}")
                 html2 = None
@@ -513,6 +518,8 @@ class CategoryCrawler:
             if page_idx > 1:
                 try:
                     html = self.renderer.fetch_html(page_url)
+                except RendererUnavailableError:
+                    raise
                 except Exception as e:
                     logger.warning(f"Listing fetch exception for {page_url}: {e}")
                     continue
@@ -528,13 +535,18 @@ class CategoryCrawler:
             if page_idx == 1 and not product_links:
                 import os as _os
 
-                debug_path = _os.path.join(_os.getcwd(), "debug_page.html")
-                try:
-                    with open(debug_path, "w", encoding="utf-8") as _f:
-                        _f.write(str(soup))
-                    logger.warning(f"[DEBUG] 0 products — HTML saved to {debug_path}")
-                except Exception as _e:
-                    logger.warning(f"[DEBUG] Could not save HTML: {_e}")
+                debug_dump_enabled = _os.environ.get(
+                    "DEBUG_SAVE_EMPTY_LISTING_HTML", ""
+                ).lower() in {"1", "true", "yes", "on"}
+                if debug_dump_enabled:
+                    debug_path = _os.path.join(_os.getcwd(), "logs", "debug_page.html")
+                    try:
+                        _os.makedirs(_os.path.dirname(debug_path), exist_ok=True)
+                        with open(debug_path, "w", encoding="utf-8") as _f:
+                            _f.write(str(soup))
+                        logger.warning(f"[DEBUG] 0 products - HTML saved to {debug_path}")
+                    except Exception as _e:
+                        logger.warning(f"[DEBUG] Could not save HTML: {_e}")
 
                 ru_links = [
                     a["href"]
@@ -555,6 +567,8 @@ class CategoryCrawler:
 
                         try:
                             sub_html = self.renderer.fetch_html(sub_url)
+                        except RendererUnavailableError:
+                            raise
                         except Exception as e:
                             logger.warning(f"Listing fetch exception for {sub_url}: {e}")
                             continue
@@ -577,7 +591,7 @@ class CategoryCrawler:
                     "product_url": product_url,
                     "source_section": section,
                     "source_subsection": subsection,
-                    "source_url": page_url,
+                    "source_url": source_url,
                 }
 
             new_pages = extract_pagination_urls(soup, page_url, self.base_url)
@@ -610,6 +624,8 @@ class CategoryCrawler:
 
         try:
             html = self.renderer.fetch_html(url)
+        except RendererUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Listing fetch exception for {url}: {e}")
             return
@@ -644,6 +660,8 @@ class CategoryCrawler:
 
                     try:
                         sub_html = self.renderer.fetch_html(sub_url)
+                    except RendererUnavailableError:
+                        raise
                     except Exception as e:
                         logger.warning(f"Listing fetch exception for {sub_url}: {e}")
                         continue

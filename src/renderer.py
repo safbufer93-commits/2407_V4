@@ -49,6 +49,62 @@ class DolphinRenderer:
         self._consecutive_start_failures = 0
         self._start_failure_threshold = 3
 
+    @staticmethod
+    def _is_duplicate_running_error(message: str) -> bool:
+        low = (message or "").lower()
+        return (
+            "already running" in low
+            or "e_browser_run_duplicate" in low
+            or "browser run duplicate" in low
+            or "profile is running" in low
+        )
+
+    @staticmethod
+    def _extract_ws_endpoint_from_payload(payload) -> Optional[str]:
+        def _walk(obj):
+            if isinstance(obj, dict):
+                ws = obj.get("wsEndpoint")
+                port = obj.get("port")
+                if ws:
+                    ws_str = str(ws)
+                    if ws_str.startswith("ws://") or ws_str.startswith("wss://"):
+                        return ws_str
+                    if port:
+                        return f"ws://localhost:{port}{ws_str}"
+                for value in obj.values():
+                    found = _walk(value)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for value in obj:
+                    found = _walk(value)
+                    if found:
+                        return found
+            return None
+
+        return _walk(payload)
+
+    def _fetch_running_ws_endpoint(self) -> Optional[str]:
+        candidates = [
+            f"{DOLPHIN_API_URL}/browser_profiles/{self.profile_id}",
+            f"{DOLPHIN_API_URL}/browser_profiles/{self.profile_id}/automation",
+        ]
+        for endpoint in candidates:
+            try:
+                r = requests.get(endpoint, timeout=15)
+                if not r.ok:
+                    continue
+                try:
+                    data = r.json()
+                except Exception:
+                    continue
+                ws_endpoint = self._extract_ws_endpoint_from_payload(data)
+                if ws_endpoint:
+                    return ws_endpoint
+            except Exception:
+                continue
+        return None
+
     def _start_profile(self) -> str:
         """Start Dolphin profile, return ws endpoint."""
         url = f"{DOLPHIN_API_URL}/browser_profiles/{self.profile_id}/start?automation=1"
@@ -60,15 +116,48 @@ class DolphinRenderer:
                     f"Starting Dolphin profile {self.profile_id} (attempt {attempt + 1}/3)..."
                 )
                 r = requests.get(url, timeout=30)
-                r.raise_for_status()
-
                 try:
                     data = r.json()
                 except Exception:
-                    raise Exception(f"Dolphin start returned non-JSON response: {r.text[:300]}")
+                    data = {}
+
+                if not r.ok:
+                    message = (
+                        data.get("error")
+                        or data.get("message")
+                        or data.get("msg")
+                        or r.text[:300]
+                    )
+                    message = str(message)
+                    if self._is_duplicate_running_error(message):
+                        ws_endpoint = self._extract_ws_endpoint_from_payload(data)
+                        if not ws_endpoint:
+                            ws_endpoint = self._fetch_running_ws_endpoint()
+                        if ws_endpoint:
+                            logger.warning(
+                                "Dolphin profile already running, using existing automation endpoint"
+                            )
+                            self._consecutive_start_failures = 0
+                            return ws_endpoint
+                    raise Exception(
+                        f"Dolphin start HTTP {r.status_code}: {message}"
+                    )
 
                 if not data.get("success"):
-                    raise Exception(f"Dolphin start failed: {data}")
+                    message = str(
+                        data.get("error") or data.get("message") or data
+                    )
+                    if self._is_duplicate_running_error(message):
+                        ws_endpoint = self._extract_ws_endpoint_from_payload(data)
+                        if not ws_endpoint:
+                            ws_endpoint = self._fetch_running_ws_endpoint()
+                        if ws_endpoint:
+                            logger.warning(
+                                "Dolphin profile already running, using existing automation endpoint"
+                            )
+                            self._consecutive_start_failures = 0
+                            return ws_endpoint
+                    raise Exception(f"Dolphin start failed: {message}")
 
                 automation = data.get("automation") or {}
                 port = automation.get("port")
@@ -425,12 +514,14 @@ class AdaptiveRenderer:
         profile_id: str = DOLPHIN_PROFILE_ID,
         delay_min: float = 2.0,
         delay_max: float = 5.0,
+        max_retries: int = 3,
         **kwargs,
     ):
         self.dolphin = DolphinRenderer(
             profile_id=profile_id,
             delay_min=delay_min,
             delay_max=delay_max,
+            max_retries=max_retries,
         )
 
     def fetch(self, url: str, force_playwright: bool = False):
