@@ -18,6 +18,26 @@ DOLPHIN_API_URL = "http://localhost:3001/v1.0"
 DOLPHIN_PROFILE_ID = os.environ.get("DOLPHIN_PROFILE_ID", "759890630")
 MAX_SHOW_MORE_CLICKS = int(os.environ.get("MAX_SHOW_MORE_CLICKS", "25"))
 
+# Markers in HTML body that indicate Cloudflare interstitial/challenge page
+_CF_BODY_MARKERS = [
+    "challenge-error-text",
+    "cf-challenge",
+    "__cf_chl_",
+    "cf_chl_prog",
+    "cf-spinner",
+    "checking your browser",
+    "just a moment",
+    "cierpliwości",
+    "cloudflare ray id",
+    "ddos protection by cloudflare",
+    "access denied",
+    "gateway time-out",
+    "504 gateway time-out",
+    "<title>504",
+    "dolphin-anty-mirror",
+    "nginx",
+]
+
 
 class RendererUnavailableError(RuntimeError):
     pass
@@ -37,15 +57,12 @@ class DolphinRenderer:
         self.delay_min = delay_min
         self.delay_max = delay_max
         self.max_retries = max_retries
-
         self._browser = None
         self._context = None
         self._page = None
         self._pw = None
         self._ws_endpoint = None
-
         self.max_show_more_clicks = max(0, MAX_SHOW_MORE_CLICKS)
-
         self._consecutive_start_failures = 0
         self._start_failure_threshold = 3
 
@@ -109,7 +126,6 @@ class DolphinRenderer:
         """Start Dolphin profile, return ws endpoint."""
         url = f"{DOLPHIN_API_URL}/browser_profiles/{self.profile_id}/start?automation=1"
         last_error = None
-
         for attempt in range(3):
             try:
                 logger.info(
@@ -120,7 +136,6 @@ class DolphinRenderer:
                     data = r.json()
                 except Exception:
                     data = {}
-
                 if not r.ok:
                     message = (
                         data.get("error")
@@ -146,14 +161,9 @@ class DolphinRenderer:
                         self._stop_profile()
                         time.sleep(2)
                         continue
-                    raise Exception(
-                        f"Dolphin start HTTP {r.status_code}: {message}"
-                    )
-
+                    raise Exception(f"Dolphin start HTTP {r.status_code}: {message}")
                 if not data.get("success"):
-                    message = str(
-                        data.get("error") or data.get("message") or data
-                    )
+                    message = str(data.get("error") or data.get("message") or data)
                     if self._is_duplicate_running_error(message):
                         ws_endpoint = self._extract_ws_endpoint_from_payload(data)
                         if not ws_endpoint:
@@ -172,32 +182,24 @@ class DolphinRenderer:
                         time.sleep(2)
                         continue
                     raise Exception(f"Dolphin start failed: {message}")
-
                 automation = data.get("automation") or {}
                 port = automation.get("port")
                 ws_path = automation.get("wsEndpoint")
-
                 if not port or not ws_path:
                     raise Exception(f"Dolphin start response missing automation data: {data}")
-
                 ws_endpoint = f"ws://localhost:{port}{ws_path}"
                 logger.info(f"Dolphin started: {ws_endpoint}")
-
                 self._consecutive_start_failures = 0
                 return ws_endpoint
-
             except Exception as e:
                 last_error = e
                 logger.warning(f"Dolphin start failed on attempt {attempt + 1}: {e}")
                 time.sleep(5)
-
         self._consecutive_start_failures += 1
-
         if self._consecutive_start_failures >= self._start_failure_threshold:
             raise RendererUnavailableError(
                 f"Dolphin API unavailable after repeated start failures: {last_error}"
             )
-
         raise Exception(f"Dolphin start request failed: {last_error}")
 
     def _stop_profile(self):
@@ -210,21 +212,16 @@ class DolphinRenderer:
 
     def _attach_to_ws(self, ws_endpoint: str):
         from playwright.sync_api import sync_playwright
-
         if self._pw is None:
             self._pw = sync_playwright().__enter__()
-
         self._browser = self._pw.chromium.connect_over_cdp(ws_endpoint)
-
         contexts = self._browser.contexts
         if contexts:
             self._context = contexts[0]
         else:
             self._context = self._browser.new_context()
-
         pages = self._context.pages
         self._page = pages[0] if pages else self._context.new_page()
-
         self._ws_endpoint = ws_endpoint
         logger.info("Connected to Dolphin browser")
 
@@ -243,9 +240,7 @@ class DolphinRenderer:
         """
         if self._page is not None:
             return
-
         last_error = None
-
         if self._ws_endpoint:
             try:
                 self._attach_to_ws(self._ws_endpoint)
@@ -253,10 +248,7 @@ class DolphinRenderer:
             except Exception as e:
                 last_error = e
                 logger.warning(f"Failed to reattach to existing ws endpoint: {e}")
-                # Keep Playwright runtime alive on reconnect path to avoid
-                # re-entering sync_playwright() and hitting asyncio-loop guard.
                 self._disconnect(keep_ws=False, keep_pw_runtime=True)
-
         try:
             ws_endpoint = self._start_profile()
             time.sleep(3)
@@ -265,7 +257,6 @@ class DolphinRenderer:
         except Exception as e:
             last_error = e
             msg = str(e)
-
             if "already running" in msg or "e_browser_run_duplicate" in msg.lower():
                 candidate_ws = self._fetch_running_ws_endpoint() or self._ws_endpoint
                 if candidate_ws:
@@ -279,7 +270,6 @@ class DolphinRenderer:
                     except Exception as e2:
                         last_error = e2
                         logger.error(f"Reattach after duplicate-running failed: {e2}")
-
             if isinstance(last_error, RendererUnavailableError):
                 raise last_error
             raise Exception(f"Connect failed: {last_error}")
@@ -291,19 +281,16 @@ class DolphinRenderer:
                     self._page.close()
                 except Exception:
                     pass
-
             if self._context:
                 try:
                     self._context.close()
                 except Exception:
                     pass
-
             if self._browser:
                 try:
                     self._browser.close()
                 except Exception:
                     pass
-
             if self._pw and not keep_pw_runtime:
                 try:
                     self._pw.__exit__(None, None, None)
@@ -311,13 +298,11 @@ class DolphinRenderer:
                     pass
         except Exception:
             pass
-
         self._browser = None
         self._context = None
         self._page = None
         if not keep_pw_runtime:
             self._pw = None
-
         if not keep_ws:
             self._ws_endpoint = None
 
@@ -336,13 +321,11 @@ class DolphinRenderer:
     def _click_tab_if_present(self, tab_label: str) -> bool:
         if self._page is None:
             return False
-
         locators = [
             self._page.get_by_role("tab", name=tab_label, exact=False),
             self._page.get_by_role("button", name=tab_label, exact=False),
             self._page.get_by_text(tab_label, exact=False),
         ]
-
         for locator in locators:
             try:
                 if locator.count() > 0:
@@ -355,7 +338,6 @@ class DolphinRenderer:
                     return True
             except Exception:
                 continue
-
         return False
 
     def _prime_product_tabs(self, url: str):
@@ -365,7 +347,6 @@ class DolphinRenderer:
         """
         if self._page is None or not self._looks_like_product_url(url):
             return
-
         for label in [
             "Совместимость с автомобилем",
             "Compatible vehicles",
@@ -382,12 +363,9 @@ class DolphinRenderer:
         """
         if self._page is None or self._looks_like_product_url(url):
             return
-
         if self.max_show_more_clicks <= 0:
             return
-
         click_count = 0
-
         for _ in range(self.max_show_more_clicks):
             locator = self._page.get_by_role(
                 "button",
@@ -397,65 +375,42 @@ class DolphinRenderer:
                 locator = self._page.get_by_text(
                     re.compile(r"Показать\s+еще|Show\s+more", re.I)
                 )
-
             if locator.count() == 0:
                 break
-
             try:
                 btn = locator.first
                 btn.scroll_into_view_if_needed(timeout=2000)
                 btn.click(timeout=4000)
                 click_count += 1
-
                 try:
                     self._page.wait_for_load_state("networkidle", timeout=4500)
                 except Exception:
                     pass
-
                 self._page.wait_for_timeout(1200)
             except Exception:
                 break
-
         if click_count:
             logger.debug(f"Expanded listing via show-more clicks: {click_count} at {url}")
 
-    def _is_error_html(self, html: str, url: str) -> bool:
+    def _is_error_html(self, html: str, url: str, silent: bool = False) -> bool:
         """
         Detect Cloudflare / waiting / gateway / Dolphin error pages
         that should NOT be treated as valid category/product HTML.
         """
         if not html:
             return True
-
         low = html.lower()
-
-        bad_markers = [
-            "challenge-error-text",
-            "cf-challenge",
-            "checking your browser",
-            "just a moment",
-            "cierpliwości",
-            "access denied",
-            "gateway time-out",
-            "504 gateway time-out",
-            "<title>504",
-            "dolphin-anty-mirror",
-            "nginx",
-        ]
-
-        for marker in bad_markers:
+        for marker in _CF_BODY_MARKERS:
             if marker in low:
-                logger.warning(f"Detected interstitial/error HTML for {url}: marker={marker}")
+                if not silent:
+                    logger.warning(f"Detected interstitial/error HTML for {url}: marker={marker}")
                 return True
-
         return False
 
     def _ensure_connected_page(self):
         if self._page is not None:
             return
-
         self._connect()
-
         if self._page is None:
             raise RuntimeError("Dolphin page is not initialized after connect")
 
@@ -465,33 +420,59 @@ class DolphinRenderer:
         for attempt in range(self.max_retries):
             try:
                 self._ensure_connected_page()
-
                 time.sleep(random.uniform(self.delay_min, self.delay_max))
-                self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-                for _ in range(15):
-                    title = self._page.title()
-                    low = title.lower()
-                    if "момент" not in low and "moment" not in low and "checking" not in low:
+                # Use "load" so Turnstile/Cloudflare JS has time to initialise
+                self._page.goto(url, wait_until="load", timeout=60000)
+
+                # Give Turnstile JS time to execute before first check
+                time.sleep(12)
+
+                # Wait for Cloudflare challenge to resolve - check title AND body
+                for wait_i in range(25):
+                    try:
+                        title = self._page.title()
+                        html_snap = self._page.content()
+                    except Exception as page_err:
+                        logger.warning(
+                            f"Page read error during CF wait ({wait_i + 1}/25): {page_err}"
+                        )
                         break
-                    logger.debug(f"Waiting for Cloudflare: {title}")
-                    time.sleep(2)
+                    low_title = title.lower()
+                    cf_in_title = (
+                        "момент" in low_title
+                        or "moment" in low_title
+                        or "checking" in low_title
+                        or "just a moment" in low_title
+                        or "verify" in low_title
+                    )
+                    cf_in_body = self._is_error_html(html_snap, url, silent=True)
+                    if not cf_in_title and not cf_in_body:
+                        break
+                    logger.debug(
+                        f"Waiting for Cloudflare ({wait_i + 1}/25): title={title!r}"
+                    )
+                    time.sleep(6)
 
                 self._expand_listing_show_more(url)
                 self._prime_product_tabs(url)
-                time.sleep(1.5)
+                time.sleep(2)
 
-                html = self._page.content()
+                try:
+                    html = self._page.content()
+                except Exception as page_err:
+                    logger.warning(f"Page content read failed after CF wait: {page_err}")
+                    raise RuntimeError(
+                        f"Page content unavailable after CF wait: {page_err}"
+                    )
 
                 if self._is_error_html(html, url):
                     logger.warning(f"Rejected error/interstitial page for {url}")
                     raise RuntimeError(
                         "Received Cloudflare / 504 / interstitial HTML instead of real page"
                     )
-
                 if html and len(html) > 1000:
                     return html
-
                 logger.warning(f"Short response ({len(html) if html else 0}) for {url}")
                 raise RuntimeError(f"Short/invalid HTML for {url}")
 
@@ -499,32 +480,30 @@ class DolphinRenderer:
                 if isinstance(e, RendererUnavailableError):
                     logger.error(f"Renderer unavailable for {url}: {e}")
                     raise
-
                 logger.warning(f"Dolphin fetch error ({attempt + 1}): {e} for {url}")
                 time.sleep(3 * (attempt + 1))
-
-                if attempt >= 1:
-                    try:
-                        self._disconnect(keep_ws=True, keep_pw_runtime=True)
-                        time.sleep(2)
-                        self._connect()
-                    except Exception as e2:
-                        if isinstance(e2, RendererUnavailableError):
-                            logger.error(f"Reconnect failed permanently: {e2}")
-                            raise
-                        if self._is_sync_api_in_async_loop_error(e2):
-                            logger.warning(
-                                "Reconnect failed due to Playwright sync-in-async-loop guard; "
-                                "forcing full runtime reset"
-                            )
-                            try:
-                                self._disconnect(keep_ws=False, keep_pw_runtime=False)
-                                time.sleep(2)
-                                self._connect()
-                                continue
-                            except Exception as e3:
-                                logger.error(f"Reconnect after full reset failed: {e3}")
-                        logger.error(f"Reconnect failed: {e2}")
+                # Reconnect on every failure, not just after the first attempt
+                try:
+                    self._disconnect(keep_ws=True, keep_pw_runtime=True)
+                    time.sleep(2)
+                    self._connect()
+                except Exception as e2:
+                    if isinstance(e2, RendererUnavailableError):
+                        logger.error(f"Reconnect failed permanently: {e2}")
+                        raise
+                    if self._is_sync_api_in_async_loop_error(e2):
+                        logger.warning(
+                            "Reconnect failed due to Playwright sync-in-async-loop guard; "
+                            "forcing full runtime reset"
+                        )
+                        try:
+                            self._disconnect(keep_ws=False, keep_pw_runtime=False)
+                            time.sleep(2)
+                            self._connect()
+                            continue
+                        except Exception as e3:
+                            logger.error(f"Reconnect after full reset failed: {e3}")
+                    logger.error(f"Reconnect failed: {e2}")
 
         logger.error(f"All retries failed for {url}")
         return None
