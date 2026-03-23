@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 DOLPHIN_API_URL = "http://localhost:3001/v1.0"
 DOLPHIN_PROFILE_ID = os.environ.get("DOLPHIN_PROFILE_ID", "759890630")
 MAX_SHOW_MORE_CLICKS = int(os.environ.get("MAX_SHOW_MORE_CLICKS", "25"))
+CHALLENGE_MANUAL_RETRIES = int(os.environ.get("CHALLENGE_MANUAL_RETRIES", "6"))
+CHALLENGE_MANUAL_WAIT = int(os.environ.get("CHALLENGE_MANUAL_WAIT", "20"))
 
 # Markers in HTML body that indicate Cloudflare interstitial/challenge page
 _CF_BODY_MARKERS = [
@@ -43,6 +45,10 @@ class RendererUnavailableError(RuntimeError):
     pass
 
 
+class ChallengeDetectedError(RuntimeError):
+    pass
+
+
 class DolphinRenderer:
     """Renders pages using Dolphin Anty antidetect browser."""
 
@@ -52,6 +58,8 @@ class DolphinRenderer:
         delay_min: float = 2.0,
         delay_max: float = 5.0,
         max_retries: int = 3,
+        challenge_manual_retries: int = CHALLENGE_MANUAL_RETRIES,
+        challenge_manual_wait: int = CHALLENGE_MANUAL_WAIT,
     ):
         self.profile_id = profile_id
         self.delay_min = delay_min
@@ -63,6 +71,8 @@ class DolphinRenderer:
         self._pw = None
         self._ws_endpoint = None
         self.max_show_more_clicks = max(0, MAX_SHOW_MORE_CLICKS)
+        self.challenge_manual_retries = max(0, int(challenge_manual_retries))
+        self.challenge_manual_wait = max(1, int(challenge_manual_wait))
         self._consecutive_start_failures = 0
         self._start_failure_threshold = 3
 
@@ -392,19 +402,70 @@ class DolphinRenderer:
         if click_count:
             logger.debug(f"Expanded listing via show-more clicks: {click_count} at {url}")
 
+    @staticmethod
+    def _first_error_marker(html: str) -> Optional[str]:
+        if not html:
+            return "empty_html"
+        low = html.lower()
+        for marker in _CF_BODY_MARKERS:
+            if marker in low:
+                return marker
+        return None
+
     def _is_error_html(self, html: str, url: str, silent: bool = False) -> bool:
         """
         Detect Cloudflare / waiting / gateway / Dolphin error pages
         that should NOT be treated as valid category/product HTML.
         """
-        if not html:
+        marker = self._first_error_marker(html)
+        if marker:
+            if not silent:
+                logger.warning(f"Detected interstitial/error HTML for {url}: marker={marker}")
             return True
-        low = html.lower()
-        for marker in _CF_BODY_MARKERS:
-            if marker in low:
-                if not silent:
-                    logger.warning(f"Detected interstitial/error HTML for {url}: marker={marker}")
+        return False
+
+    def _wait_for_manual_clearance(self, url: str, marker: str) -> bool:
+        """
+        Give operator time to solve/check challenge manually in opened Dolphin browser.
+        Returns True if interstitial disappears, otherwise False.
+        """
+        if self._page is None or self.challenge_manual_retries <= 0:
+            return False
+
+        for i in range(self.challenge_manual_retries):
+            logger.warning(
+                "Cloudflare/interstitial page detected for %s (marker=%s). "
+                "Waiting %ss for manual clearance in Dolphin (%s/%s)...",
+                url,
+                marker,
+                self.challenge_manual_wait,
+                i + 1,
+                self.challenge_manual_retries,
+            )
+            time.sleep(self.challenge_manual_wait)
+
+            try:
+                html_now = self._page.content()
+            except Exception as e:
+                logger.warning(f"Could not read page content during manual wait: {e}")
+                continue
+
+            marker_now = self._first_error_marker(html_now)
+            if not marker_now and html_now and len(html_now) > 1000:
+                logger.info(f"Manual clearance detected, continuing: {url}")
                 return True
+
+            try:
+                self._page.reload(wait_until="load", timeout=60000)
+                self._page.wait_for_timeout(1500)
+                html_reload = self._page.content()
+                marker_reload = self._first_error_marker(html_reload)
+                if not marker_reload and html_reload and len(html_reload) > 1000:
+                    logger.info(f"Interstitial cleared after reload, continuing: {url}")
+                    return True
+            except Exception:
+                pass
+
         return False
 
     def _ensure_connected_page(self):
@@ -466,10 +527,18 @@ class DolphinRenderer:
                         f"Page content unavailable after CF wait: {page_err}"
                     )
 
-                if self._is_error_html(html, url):
-                    logger.warning(f"Rejected error/interstitial page for {url}")
-                    raise RuntimeError(
-                        "Received Cloudflare / 504 / interstitial HTML instead of real page"
+                marker = self._first_error_marker(html)
+                if marker:
+                    logger.warning(
+                        f"Rejected error/interstitial page for {url}: marker={marker}"
+                    )
+                    if self._wait_for_manual_clearance(url, marker):
+                        html = self._page.content()
+                        marker = self._first_error_marker(html)
+                        if not marker and html and len(html) > 1000:
+                            return html
+                    raise ChallengeDetectedError(
+                        f"Cloudflare/interstitial still active (marker={marker}) for {url}"
                     )
                 if html and len(html) > 1000:
                     return html
@@ -479,6 +548,9 @@ class DolphinRenderer:
             except Exception as e:
                 if isinstance(e, RendererUnavailableError):
                     logger.error(f"Renderer unavailable for {url}: {e}")
+                    raise
+                if isinstance(e, ChallengeDetectedError):
+                    logger.error(f"Challenge not cleared for {url}: {e}")
                     raise
                 logger.warning(f"Dolphin fetch error ({attempt + 1}): {e} for {url}")
                 time.sleep(3 * (attempt + 1))
@@ -539,6 +611,7 @@ class AdaptiveRenderer:
             delay_min=delay_min,
             delay_max=delay_max,
             max_retries=max_retries,
+            **kwargs,
         )
 
     def fetch(self, url: str, force_playwright: bool = False):

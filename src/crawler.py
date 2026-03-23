@@ -8,7 +8,7 @@ from typing import List, Set, Generator
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
 
 from bs4 import BeautifulSoup
-from src.renderer import RendererUnavailableError
+from src.renderer import RendererUnavailableError, ChallengeDetectedError
 
 logger = logging.getLogger(__name__)
 
@@ -437,7 +437,7 @@ class CategoryCrawler:
 
         try:
             html = self.renderer.fetch_html(url)
-        except RendererUnavailableError:
+        except (RendererUnavailableError, ChallengeDetectedError):
             raise
         except Exception as e:
             logger.warning(f"Listing fetch exception for {url}: {e}")
@@ -508,7 +508,7 @@ class CategoryCrawler:
         if max_url != listing_url:
             try:
                 html2 = self.renderer.fetch_html(max_url)
-            except RendererUnavailableError:
+            except (RendererUnavailableError, ChallengeDetectedError):
                 raise
             except Exception as e:
                 logger.warning(f"Listing fetch exception for {max_url}: {e}")
@@ -529,7 +529,7 @@ class CategoryCrawler:
             if page_idx > 1:
                 try:
                     html = self.renderer.fetch_html(page_url)
-                except RendererUnavailableError:
+                except (RendererUnavailableError, ChallengeDetectedError):
                     raise
                 except Exception as e:
                     logger.warning(f"Listing fetch exception for {page_url}: {e}")
@@ -577,7 +577,7 @@ class CategoryCrawler:
 
                             try:
                                 sub_html = self.renderer.fetch_html(sub_url)
-                            except RendererUnavailableError:
+                            except (RendererUnavailableError, ChallengeDetectedError):
                                 raise
                             except Exception as e:
                                 logger.warning(f"Listing fetch exception for {sub_url}: {e}")
@@ -638,7 +638,7 @@ class CategoryCrawler:
 
         try:
             html = self.renderer.fetch_html(url)
-        except RendererUnavailableError:
+        except (RendererUnavailableError, ChallengeDetectedError):
             raise
         except Exception as e:
             logger.warning(f"Listing fetch exception for {url}: {e}")
@@ -674,7 +674,7 @@ class CategoryCrawler:
 
                     try:
                         sub_html = self.renderer.fetch_html(sub_url)
-                    except RendererUnavailableError:
+                    except (RendererUnavailableError, ChallengeDetectedError):
                         raise
                     except Exception as e:
                         logger.warning(f"Listing fetch exception for {sub_url}: {e}")

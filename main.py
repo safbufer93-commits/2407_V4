@@ -50,7 +50,7 @@ from src.exporter import (
     MAX_ORIGINAL_PAIRS,
     MAX_ANALOG_PAIRS,
 )
-from src.renderer import RendererUnavailableError
+from src.renderer import RendererUnavailableError, ChallengeDetectedError
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,18 @@ def parse_args():
         default=int(os.environ.get("RENDERER_RECOVER_WAIT", "10")),
         help="Seconds to wait before renderer recovery attempt",
     )
+    parser.add_argument(
+        "--challenge-manual-retries",
+        type=int,
+        default=int(os.environ.get("CHALLENGE_MANUAL_RETRIES", "6")),
+        help="How many manual-clearance waits to do on Cloudflare/interstitial pages",
+    )
+    parser.add_argument(
+        "--challenge-manual-wait",
+        type=int,
+        default=int(os.environ.get("CHALLENGE_MANUAL_WAIT", "20")),
+        help="Seconds to wait for manual challenge clearance between retries",
+    )
     return parser.parse_args()
 
 
@@ -236,7 +248,7 @@ def recover_renderer(renderer, wait_seconds: int = 10) -> bool:
         return False
 
 
-def build_renderer():
+def build_renderer(args):
     from src.renderer import AdaptiveRenderer
 
     return AdaptiveRenderer(
@@ -244,6 +256,8 @@ def build_renderer():
         delay_min=REQUEST_DELAY_MIN,
         delay_max=REQUEST_DELAY_MAX,
         max_retries=MAX_RETRIES,
+        challenge_manual_retries=args.challenge_manual_retries,
+        challenge_manual_wait=args.challenge_manual_wait,
     )
 
 
@@ -258,6 +272,8 @@ def process_product(product_info: dict, renderer, metrics: Metrics) -> list:
     t0 = time.time()
     try:
         html = renderer.fetch_html(url)
+    except ChallengeDetectedError:
+        raise
     except RendererUnavailableError:
         raise
     except Exception as e:
@@ -385,9 +401,10 @@ def main():
     resume_active = bool(resume_state.get("product_url")) and not args.no_resume
     resume_hit = False
     terminated_due_renderer = False
+    terminated_due_challenge = False
     completed_without_fatal = False
 
-    renderer = build_renderer()
+    renderer = build_renderer(args)
 
     logger.info("Setting up Poland/PLN context...")
     renderer.setup_poland()
@@ -456,6 +473,19 @@ def main():
                     last_product_info = product_info
                 except StopIteration:
                     break
+                except ChallengeDetectedError as e:
+                    if not args.no_resume:
+                        checkpoint = {
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                            "source_section": (last_product_info or {}).get("source_section", seed["section"]),
+                            "source_subsection": (last_product_info or {}).get("source_subsection", ""),
+                            "source_url": (last_product_info or {}).get("source_url", seed["url"]),
+                            "product_url": (last_product_info or {}).get("product_url", ""),
+                            "error": f"challenge_during_listing: {e}",
+                        }
+                        save_resume_state(resume_file, checkpoint)
+                    terminated_due_challenge = True
+                    raise
                 except RendererUnavailableError:
                     if not args.no_resume:
                         checkpoint = {
@@ -507,6 +537,19 @@ def main():
                     try:
                         rows = process_product(product_info, renderer, metrics)
                         break
+                    except ChallengeDetectedError as e:
+                        checkpoint = {
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                            "source_section": product_info.get("source_section"),
+                            "source_subsection": product_info.get("source_subsection"),
+                            "source_url": src_url,
+                            "product_url": prod_url,
+                            "error": str(e),
+                        }
+                        if not args.no_resume:
+                            save_resume_state(resume_file, checkpoint)
+                        terminated_due_challenge = True
+                        raise
                     except RendererUnavailableError as e:
                         checkpoint = {
                             "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -591,6 +634,9 @@ def main():
     except RendererUnavailableError as e:
         terminated_due_renderer = True
         logger.error(f"Renderer unavailable, stopping run: {e}", exc_info=True)
+    except ChallengeDetectedError as e:
+        terminated_due_challenge = True
+        logger.error(f"Challenge detected, stopping run for manual intervention: {e}")
     except Exception as e:
         logger.error(f"Fatal: {e}", exc_info=True)
     finally:
@@ -607,7 +653,12 @@ def main():
         metrics.save_report(report)
         metrics.print_summary()
         logger.info(f"Done. Output: {output_dir}")
-        if not args.no_resume and completed_without_fatal and not terminated_due_renderer:
+        if (
+            not args.no_resume
+            and completed_without_fatal
+            and not terminated_due_renderer
+            and not terminated_due_challenge
+        ):
             clear_resume_state(resume_file)
 
 
