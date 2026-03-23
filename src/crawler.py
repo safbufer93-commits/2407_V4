@@ -1,6 +1,7 @@
 ﻿"""
 Crawler module: traverses only subcategories within seed URL scope.
 """
+import os
 import logging
 import re
 from typing import List, Set, Generator
@@ -35,6 +36,12 @@ PRODUCT_CSS = [
     "SparePartsItemLink",
     "CatalogueListItemTitleLink",
 ]
+
+# Disabled by default: when first listing page has 0 products, do not descend into
+# /trademark=* brand filters unless explicitly requested.
+ENABLE_TRADEMARK_FALLBACK = os.environ.get(
+    "ENABLE_TRADEMARK_FALLBACK", ""
+).lower() in {"1", "true", "yes", "on"}
 
 
 def is_forbidden_url(url: str) -> bool:
@@ -153,7 +160,9 @@ def extract_subcategory_links(
     return list(links)
 
 
-CAR_FILTER_RE = re.compile(r"/([\w-]+-cars|[\w-]+-brand|[\w-]+-auto)/", re.I)
+# Product pages often use /<vendor>-brand/<product-slug>/, so "-brand" must not be
+# treated as a car filter marker.
+CAR_FILTER_RE = re.compile(r"/([\w-]+-cars|[\w-]+-auto)/", re.I)
 
 
 def _is_car_filter_url(path: str) -> bool:
@@ -286,6 +295,8 @@ def extract_pagination_urls(
             full_url = urljoin(base_url, href)
             parsed = urlparse(full_url)
             if parsed.netloc not in (BASE_DOMAIN, "www." + BASE_DOMAIN):
+                continue
+            if "trademark=" in full_url or "brand=" in full_url:
                 continue
             norm = normalize_url(full_url)
             if norm not in seen:
@@ -533,15 +544,13 @@ class CategoryCrawler:
             logger.info(f"Page {page_idx}: {len(product_links)} products at {page_url}")
 
             if page_idx == 1 and not product_links:
-                import os as _os
-
-                debug_dump_enabled = _os.environ.get(
+                debug_dump_enabled = os.environ.get(
                     "DEBUG_SAVE_EMPTY_LISTING_HTML", ""
                 ).lower() in {"1", "true", "yes", "on"}
                 if debug_dump_enabled:
-                    debug_path = _os.path.join(_os.getcwd(), "logs", "debug_page.html")
+                    debug_path = os.path.join(os.getcwd(), "logs", "debug_page.html")
                     try:
-                        _os.makedirs(_os.path.dirname(debug_path), exist_ok=True)
+                        os.makedirs(os.path.dirname(debug_path), exist_ok=True)
                         with open(debug_path, "w", encoding="utf-8") as _f:
                             _f.write(str(soup))
                         logger.warning(f"[DEBUG] 0 products - HTML saved to {debug_path}")
@@ -555,36 +564,41 @@ class CategoryCrawler:
                 ][:30]
                 logger.warning(f"[DEBUG] Sample /ru/ links on page: {ru_links}")
 
-                trademark_links = extract_trademark_listing_links(soup, self.base_url, cat_url)
-                if trademark_links:
-                    logger.info(
-                        f"Fallback: {len(trademark_links)} trademark sub-listings at {cat_url}"
-                    )
-                    for sub_url in trademark_links:
-                        sub_norm = normalize_url(sub_url)
-                        if sub_norm in self.visited_listings:
-                            continue
-
-                        try:
-                            sub_html = self.renderer.fetch_html(sub_url)
-                        except RendererUnavailableError:
-                            raise
-                        except Exception as e:
-                            logger.warning(f"Listing fetch exception for {sub_url}: {e}")
-                            continue
-
-                        if not sub_html:
-                            continue
-
-                        sub_soup = BeautifulSoup(sub_html, "lxml")
-                        yield from self._crawl_listing(
-                            sub_url,
-                            sub_soup,
-                            section,
-                            subsection,
-                            source_url=sub_url,
+                if ENABLE_TRADEMARK_FALLBACK:
+                    trademark_links = extract_trademark_listing_links(soup, self.base_url, cat_url)
+                    if trademark_links:
+                        logger.info(
+                            f"Fallback: {len(trademark_links)} trademark sub-listings at {cat_url}"
                         )
-                    continue
+                        for sub_url in trademark_links:
+                            sub_norm = normalize_url(sub_url)
+                            if sub_norm in self.visited_listings:
+                                continue
+
+                            try:
+                                sub_html = self.renderer.fetch_html(sub_url)
+                            except RendererUnavailableError:
+                                raise
+                            except Exception as e:
+                                logger.warning(f"Listing fetch exception for {sub_url}: {e}")
+                                continue
+
+                            if not sub_html:
+                                continue
+
+                            sub_soup = BeautifulSoup(sub_html, "lxml")
+                            yield from self._crawl_listing(
+                                sub_url,
+                                sub_soup,
+                                section,
+                                subsection,
+                                source_url=sub_url,
+                            )
+                        continue
+                else:
+                    logger.info(
+                        "Trademark fallback is disabled; skipping /trademark=* sub-listings"
+                    )
 
             for product_url in product_links:
                 yield {
