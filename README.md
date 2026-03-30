@@ -101,6 +101,29 @@ playwright install-deps chromium   # Linux only
 python main.py
 ```
 
+## One-Click Start On Windows (no manual setup)
+
+If you want to move the project to another Windows PC and run it with one click:
+
+1. Copy/clone the repository to that PC.
+2. (Optional) Replace `src/renderer.py` with your required version.
+3. Double-click `START.bat`.
+
+What `START.bat` does automatically:
+
+- finds Python (or installs Python 3.13 via `winget` if missing),
+- creates `.venv`,
+- installs dependencies from `requirements.txt`,
+- starts crawler with:
+  - `--no-sitemap`
+  - `--categories-file config/sitemap-category-ru.csv`
+
+You can also pass custom args from terminal:
+
+```bash
+START.bat --limit 100
+```
+
 ---
 
 ## Excel Output Schema (15 columns)
