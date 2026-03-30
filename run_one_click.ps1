@@ -19,18 +19,26 @@ function Write-Warn([string]$Message) {
     Write-Host "[WARN] $Message" -ForegroundColor Yellow
 }
 
-function Resolve-PythonExe([string]$RepoRoot) {
-    $venvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-    if (Test-Path $venvPython) {
-        return $venvPython
+function Test-PythonExecutable([string]$PythonPath) {
+    if (-not $PythonPath -or -not (Test-Path $PythonPath)) {
+        return $false
     }
+    try {
+        & $PythonPath -c "import sys; print(sys.executable)" *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
 
+function Resolve-SystemPythonExe {
     $pyCmd = Get-Command py -ErrorAction SilentlyContinue
     if ($pyCmd) {
         foreach ($selector in @("-3", "-3.13", "-3.12", "-3.11", "-3.10")) {
             try {
                 $resolved = (& py $selector -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1).Trim()
-                if ($resolved -and (Test-Path $resolved)) {
+                if ($resolved -and (Test-Path $resolved) -and (Test-PythonExecutable -PythonPath $resolved)) {
                     return $resolved
                 }
             }
@@ -40,7 +48,7 @@ function Resolve-PythonExe([string]$RepoRoot) {
     }
 
     $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($pythonCmd -and $pythonCmd.Source) {
+    if ($pythonCmd -and $pythonCmd.Source -and (Test-PythonExecutable -PythonPath $pythonCmd.Source)) {
         return $pythonCmd.Source
     }
 
@@ -50,7 +58,7 @@ function Resolve-PythonExe([string]$RepoRoot) {
             "$env:LocalAppData\Programs\Python\Python311\python.exe",
             "$env:LocalAppData\Programs\Python\Python310\python.exe"
         )) {
-        if (Test-Path $candidate) {
+        if ((Test-Path $candidate) -and (Test-PythonExecutable -PythonPath $candidate)) {
             return $candidate
         }
     }
@@ -75,37 +83,76 @@ function Install-PythonWithWinget {
     $env:Path = "$machinePath;$userPath"
 }
 
+function Ensure-HealthyVenv([string]$RepoRoot, [string]$BootstrapPython) {
+    $venvDir = Join-Path $RepoRoot ".venv"
+    $venvPython = Join-Path $venvDir "Scripts\python.exe"
+
+    if (Test-Path $venvPython) {
+        if (Test-PythonExecutable -PythonPath $venvPython) {
+            Write-Info "Virtual environment already exists."
+            return $venvPython
+        }
+        Write-Warn "Existing .venv is broken (likely copied from another PC). Recreating .venv..."
+        try {
+            Remove-Item $venvDir -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            throw "Failed to remove broken .venv: $($_.Exception.Message)"
+        }
+    }
+    elseif (Test-Path $venvDir) {
+        Write-Warn "Virtual environment folder exists but python executable is missing. Recreating .venv..."
+        try {
+            Remove-Item $venvDir -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            throw "Failed to clean invalid .venv folder: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Info "Creating virtual environment (.venv)..."
+    & $BootstrapPython -m venv ".venv"
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
+        throw "Failed to create .venv (exit code $LASTEXITCODE)."
+    }
+    if (-not (Test-PythonExecutable -PythonPath $venvPython)) {
+        throw "Created .venv is not usable. Check local Python installation."
+    }
+    return $venvPython
+}
+
 $RepoRoot = Split-Path -Parent $PSCommandPath
 Set-Location $RepoRoot
 
 Write-Info "Repository: $RepoRoot"
 
-$pythonExe = Resolve-PythonExe -RepoRoot $RepoRoot
-if (-not $pythonExe) {
-    if ($SkipPythonInstall) {
-        throw "Python was not found and -SkipPythonInstall was specified."
+$existingVenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$hasHealthyExistingVenv = Test-PythonExecutable -PythonPath $existingVenvPython
+
+$bootstrapPython = Resolve-SystemPythonExe
+if (-not $bootstrapPython) {
+    if ($hasHealthyExistingVenv) {
+        Write-Warn "System Python not found. Reusing existing healthy .venv."
+        $venvPython = $existingVenvPython
     }
-    Install-PythonWithWinget
-    $pythonExe = Resolve-PythonExe -RepoRoot $RepoRoot
-}
-
-if (-not $pythonExe) {
-    throw "Python is still unavailable after attempted install."
-}
-
-Write-Info "Using Python: $pythonExe"
-
-$venvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path $venvPython)) {
-    Write-Info "Creating virtual environment (.venv)..."
-    & $pythonExe -m venv ".venv"
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
-        throw "Failed to create .venv (exit code $LASTEXITCODE)."
+    else {
+        if ($SkipPythonInstall) {
+            throw "Python was not found and -SkipPythonInstall was specified."
+        }
+        Install-PythonWithWinget
+        $bootstrapPython = Resolve-SystemPythonExe
+        if (-not $bootstrapPython) {
+            throw "Python is still unavailable after attempted install."
+        }
     }
 }
-else {
-    Write-Info "Virtual environment already exists."
+
+if (-not $venvPython) {
+    Write-Info "Using system Python: $bootstrapPython"
+    $venvPython = Ensure-HealthyVenv -RepoRoot $RepoRoot -BootstrapPython $bootstrapPython
 }
+
+Write-Info "Using venv Python: $venvPython"
 
 if (-not $SkipDependencyInstall) {
     Write-Info "Installing/updating pip, setuptools, wheel..."
